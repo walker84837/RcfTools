@@ -18,6 +18,7 @@
 
 #include "rcf_file.h"
 #include "rcf_hash.h"
+#include "rz.h"
 
 namespace {
 
@@ -125,6 +126,7 @@ void PrintUsage() {
            "  extract-all <archive.rcf> [-o d]   extract all members\n"
            "  verify <archive.rcf>               structural checks\n"
            "  hash <path>...                     print Radical hash(es)\n"
+           "  rz <file.p3d.rz> [-o outdir]       decompress .p3d.rz (zlib)\n"
            "  pack <srcdir> <out.rcf>            rebuild archive "
            "(experimental)\n";
 }
@@ -144,6 +146,20 @@ int main(int argc, char** argv) {
                 return 2;
             }
             return CmdHash({argv + 2, argv + argc});
+        }
+        if (cmd == "rz") {
+            if (argc < 3) {
+                std::cerr << "error: rz needs <file.p3d.rz> [-o outdir]\n";
+                return 2;
+            }
+            std::filesystem::path outDir = ".";
+            for (int i = 3; i + 1 < argc; ++i) {
+                if (std::string(argv[i]) == "-o") {
+                    outDir = argv[i + 1];
+                }
+            }
+            RcfRz::ExtractRz(argv[2], outDir);
+            return 0;
         }
         if (cmd == "pack") {
             if (argc != 4) {
