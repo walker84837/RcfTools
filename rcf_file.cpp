@@ -1,428 +1,407 @@
+// RcfArchive implementation. Format notes live in rcf.h.
+
 #include "rcf_file.h"
 
-RcfFile::RcfFile(std::string file) : filePath(file)
-{
-	LoadHeader();
-	LoadMetadata();
-	LoadEntries();
+#include <algorithm>
+#include <ctime>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+
+#include "rcf_hash.h"
+#include "utils.h"
+
+namespace {
+
+std::vector<std::uint8_t> ReadWholeFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("cannot open file: " + path.string());
+    }
+    in.seekg(0, std::ios::end);
+    const auto size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(size));
+    if (!buf.empty()) {
+        in.read(reinterpret_cast<char*>(buf.data()),
+                static_cast<std::streamsize>(buf.size()));
+    }
+    return buf;
 }
 
-std::vector<uint8_t> RcfFile::ReadFile(uint32_t from, uint32_t length)
-{
-	std::vector<uint8_t> buffer(length);
-	std::ifstream file(filePath, std::ifstream::binary);
-	file.seekg(from);
-	file.read((char*)buffer.data(), length);
-
-	file.close();
-
-	return buffer;
+void WriteWholeFile(const std::filesystem::path& path,
+                    const std::vector<std::uint8_t>& buf) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot write file: " + path.string());
+    }
+    if (!buf.empty()) {
+        out.write(reinterpret_cast<const char*>(buf.data()),
+                  static_cast<std::streamsize>(buf.size()));
+    }
 }
 
-void RcfFile::LoadHeader()
-{
-	std::vector<uint8_t> rawData = ReadFile(0, HEADER_LENGTH);
+} // namespace
 
-	header = RcfHeader();	
-	uint8_t offset;
+RcfArchive::RcfArchive(const std::filesystem::path& file) { load(file); }
 
-	//Name
-	offset = EnumToValue(RcfHeaderOffsets::Name);
-	for (uint8_t i = 0; i < 32; i++) {
-		header.name.push_back(rawData[offset + i]);
-	}
-
-	//Version
-	offset = EnumToValue(RcfHeaderOffsets::Version);
-	for (uint8_t i = 0; i < 2; i++) {
-		header.version[i] = rawData[EnumToValue(RcfHeaderOffsets::Version) + i];
-	}
-
-	//Endianess
-	offset = EnumToValue(RcfHeaderOffsets::EndianFlag);
-	header.big_endian = rawData[offset];
-
-	//Is library valid?
-	offset = EnumToValue(RcfHeaderOffsets::LibraryValid);
-	header.libraryValid = rawData[offset];
-
-	//Entries Offset
-	offset = EnumToValue(RcfHeaderOffsets::EntryOffset);
-	header.entryOffset = BytesToValue(4, offset, rawData.data());
-
-	//Entries Length
-	offset = EnumToValue(RcfHeaderOffsets::EntryLength);
-	header.entryLength = BytesToValue(4, offset, rawData.data());
-
-	//Filename Offset
-	offset = EnumToValue(RcfHeaderOffsets::MetadataOffset);
-	header.metadataOffset = BytesToValue(4, offset, rawData.data());
-
-	//Filename Length
-	offset = EnumToValue(RcfHeaderOffsets::MetadataLength);
-	header.metadataLength = BytesToValue(4, offset, rawData.data());
-
-	//Number of files
-	offset = EnumToValue(RcfHeaderOffsets::NumberOfFiles);
-	header.numberOfFiles = BytesToValue(4, offset, rawData.data());
+void RcfArchive::load(const std::filesystem::path& file) {
+    path_ = file;
+    image_ = ReadWholeFile(file);
+    members_.clear();
+    parseHeader();
+    parseEntries();
+    parseMetadata();
 }
 
-void RcfFile::LoadEntries()
-{
-	if (header.numberOfFiles <= 0)
-		return;
-
-	std::vector<uint8_t> rawData = ReadFile(header.entryOffset, header.entryLength);
-
-	RcfEntry entry;
-	for (int i = 0; i < header.numberOfFiles; i++) {
-		//We multiply by 12 because thats the size of an entry block: Hash (4 bytes) + Offset (4 bytes) + Length (4 bytes) = 12 bytes 
-		entry = ReadEntry(12 * i, rawData);
-		entryList.push_back(entry);
-	}
+std::vector<std::uint8_t> RcfArchive::slice(std::uint32_t from,
+                                            std::uint32_t length) const {
+    if (static_cast<std::uint64_t>(from) + length > image_.size()) {
+        throw std::runtime_error("archive truncated: slice out of range");
+    }
+    return {image_.begin() + from, image_.begin() + from + length};
 }
 
-RcfEntry RcfFile::ReadEntry(uint32_t baseOffset, std::vector<uint8_t>& rawData)
-{
-	RcfEntry entry = RcfEntry();
-	uint8_t offset;
+void RcfArchive::parseHeader() {
+    if (image_.size() < kRcfHeaderLength) {
+        throw std::runtime_error("file too small to be an RCF archive");
+    }
+    const auto* d = image_.data();
 
-	//Hash
-	offset = EnumToValue(RcfEntryOffsets::Hash);
-	entry.hash = BytesToValue(4, baseOffset + offset, rawData.data());
+    std::string name(reinterpret_cast<const char*>(d), 32);
+    if (auto nul = name.find('\0'); nul != std::string::npos) {
+        name.resize(nul);
+    }
+    const bool isAtg = name == kMagicAtg;
+    const bool isRadcore = name == kMagicRadcore;
+    if (!isAtg && !isRadcore) {
+        throw std::runtime_error("bad RCF magic: '" + name + "'");
+    }
 
-	//Offset
-	offset = EnumToValue(RcfEntryOffsets::Offset);
-	entry.dataOffset = BytesToValue(4, baseOffset + offset, rawData.data());
+    header_.name = name;
+    header_.version = ReadU32LE(d, EnumToValue(RcfHeaderOffsets::Version));
+    header_.bigEndian = d[EnumToValue(RcfHeaderOffsets::EndianFlag)] != 0;
+    header_.libraryValid =
+        d[EnumToValue(RcfHeaderOffsets::LibraryValid)] != 0;
+    header_.entryOffset = ReadU32LE(d, EnumToValue(RcfHeaderOffsets::EntryOffset));
+    header_.entryLength = ReadU32LE(d, EnumToValue(RcfHeaderOffsets::EntryLength));
+    header_.metadataOffset =
+        ReadU32LE(d, EnumToValue(RcfHeaderOffsets::MetadataOffset));
+    header_.metadataLength =
+        ReadU32LE(d, EnumToValue(RcfHeaderOffsets::MetadataLength));
+    header_.numberOfFiles =
+        ReadU32LE(d, EnumToValue(RcfHeaderOffsets::NumberOfFiles));
 
-	//Length
-	offset = EnumToValue(RcfEntryOffsets::Length);
-	entry.dataLength = BytesToValue(4, baseOffset + offset, rawData.data());
-
-	//Data
-	std::vector<uint8_t> data = ReadFile(entry.dataOffset, entry.dataLength);
-	for (size_t i = 0; i < entry.dataLength; i++) {
-		entry.data.push_back(data[i]);
-	}
-
-	//Metadata ref
-	entry.metadata = FindMetadata(entry.hash);
-
-	return entry;
+    if (header_.bigEndian) {
+        throw std::runtime_error("big-endian RCF archives are not supported");
+    }
+    if (!header_.libraryValid) {
+        throw std::runtime_error("RCF library-valid flag is not set");
+    }
+    if (header_.version != kVersionPrototype2 &&
+        header_.version != kVersionShar) {
+        std::cerr << "warning: unknown RCF version 0x" << std::hex
+                  << header_.version << std::dec << "; attempting parse\n";
+    }
 }
 
-void RcfFile::LoadMetadata()
-{
-	if (header.numberOfFiles <= 0)
-		return;
-
-	std::vector<uint8_t> rawData = ReadFile(header.metadataOffset, header.metadataLength);
-
-	RcfMetadata metadata = ReadMetadata(EnumToValue(RcfMetadataOffsets::FolderPadding), rawData);
-	metadataList.push_back(metadata);
-
-	uint32_t offset = EnumToValue(RcfMetadataOffsets::FolderPadding) + EnumToValue(RcfMetadataOffsets::Filename) + metadata.filenameLength + 3;
-	for (int i = 1; i < header.numberOfFiles; i++) {		
-		metadata = ReadMetadata(offset, rawData);
-		metadataList.push_back(metadata);
-		offset += EnumToValue(RcfMetadataOffsets::Filename) + metadata.filenameLength + 3;
-	}
+void RcfArchive::parseEntries() {
+    const std::uint64_t count = header_.numberOfFiles;
+    if (count * kRcfEntrySize != header_.entryLength) {
+        throw std::runtime_error("entry length does not match file count");
+    }
+    if (static_cast<std::uint64_t>(header_.entryOffset) +
+            header_.entryLength >
+        image_.size()) {
+        throw std::runtime_error("entry directory out of range");
+    }
+    const auto* d = image_.data();
+    members_.reserve(static_cast<std::size_t>(count));
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const std::uint32_t base = header_.entryOffset +
+                                   static_cast<std::uint32_t>(i * kRcfEntrySize);
+        RcfMember m;
+        m.hash = ReadU32LE(d, base + EnumToValue(RcfEntryOffsets::Hash));
+        m.offset = ReadU32LE(d, base + EnumToValue(RcfEntryOffsets::Offset));
+        m.size = ReadU32LE(d, base + EnumToValue(RcfEntryOffsets::Length));
+        if (static_cast<std::uint64_t>(m.offset) + m.size > image_.size()) {
+            throw std::runtime_error("member data out of range");
+        }
+        members_.push_back(m);
+    }
 }
 
+void RcfArchive::parseMetadata() {
+    if (header_.numberOfFiles == 0 || header_.metadataLength == 0) {
+        return; // SHAR-style archives carry no names; hashes only.
+    }
+    if (static_cast<std::uint64_t>(header_.metadataOffset) +
+            header_.metadataLength >
+        image_.size()) {
+        throw std::runtime_error("metadata table out of range");
+    }
+    const auto* d = image_.data();
+    std::uint32_t off = header_.metadataOffset + kMetadataPreambleSize;
+    const std::uint32_t end = header_.metadataOffset + header_.metadataLength;
 
-RcfMetadata RcfFile::ReadMetadata(uint32_t baseOffset, std::vector<uint8_t>& rawData)
-{
-
-	RcfMetadata metadata = RcfMetadata();
-	uint8_t offset;
-
-	//Date
-	offset = EnumToValue(RcfMetadataOffsets::Date);
-	metadata.date = (time_t)BytesToValue(4, baseOffset + offset, rawData.data());
-
-	//Padding
-	offset = EnumToValue(RcfMetadataOffsets::Padding);
-	for (uint8_t i = 0; i < 4; i++) {
-		metadata.padding[i] = rawData[baseOffset + offset + i];
-	}
-
-	//Filename length
-	offset = EnumToValue(RcfMetadataOffsets::FilenameLength);
-	metadata.filenameLength = BytesToValue(4, baseOffset + offset, rawData.data());
-
-	//Filename
-	offset = EnumToValue(RcfMetadataOffsets::Filename);
-	for (uint8_t i = 0; i < metadata.filenameLength; i++) {
-		metadata.filename.push_back(rawData[baseOffset + offset + i]);
-	}
-
-	return metadata;
+    // Name every member whose hash matches (linear; tables are tiny).
+    for (std::uint64_t i = 0;
+         i < header_.numberOfFiles && off + kMetadataRecordHeader <= end;
+         ++i) {
+        const std::uint32_t date = ReadU32LE(d, off + 0x00);
+        (void)date;
+        const std::uint32_t len = ReadU32LE(d, off + 0x0C);
+        if (len == 0 || off + kMetadataRecordHeader + len > end) {
+            break;
+        }
+        std::string name(reinterpret_cast<const char*>(d + off + 0x10), len);
+        if (!name.empty() && name.back() == '\0') {
+            name.pop_back();
+        }
+        const std::uint32_t h =
+            RadicalHash(NormaliseRcfPath(name));
+        for (auto& m : members_) {
+            if (m.hash == h && m.name.empty()) {
+                m.name = name;
+                break;
+            }
+        }
+        off += kMetadataRecordHeader + len + kMetadataRecordTailPad;
+    }
 }
 
-RcfMetadata* RcfFile::FindMetadata(uint32_t hash)
-{
-	for (size_t i = 0; i < metadataList.size(); i++) {
-		RcfMetadata* p = &metadataList[i];
-		uint32_t hashedStr = HashString(p->filename.c_str());
-		if (hashedStr == hash)
-			return p;
-	}
-
-	return nullptr;
+std::optional<std::size_t> RcfArchive::findByHash(
+    std::uint32_t hash) const noexcept {
+    std::size_t lo = 0, hi = members_.size();
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (members_[mid].hash == hash) {
+            return mid;
+        }
+        if (members_[mid].hash < hash) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return std::nullopt;
 }
 
-void RcfFile::Extract(size_t entryIndex, std::string path)
-{
-	RcfEntry* entry = &entryList[entryIndex];
-	RcfMetadata* metadata = entry->metadata;
-	
-	path += metadata->filename;
-	std::vector<std::string> paths = SplitStringPath(path, "\\");
-	size_t pos = path.find(paths.back());
-	std::string dest = path.substr(0, pos);
-
-	std::filesystem::create_directories(dest);
-
-	std::ofstream os(path, std::ios::out | std::ios::binary);
-	for (size_t i = 0; i < entry->dataLength; i++) {
-		os.write((char*)&entry->data[i], sizeof(uint8_t));
-	}
-	os.close();
-
-	if (!os.good()) {
-		std::cout << "Error occurred at writing time!" << std::endl;
-	}
+std::optional<std::size_t> RcfArchive::findByPath(
+    const std::string& path) const {
+    return findByHash(RadicalHash(NormaliseRcfPath(path)));
 }
 
-void RcfFile::Deserialize()
-{
-	std::cout << "Unpacking..." << std::endl;
-	for (size_t i = 0; i < entryList.size(); i++) {
-		Extract(i, ".\\extracted\\");
-	}
-
-	std::cout << "Unpacking done! " << entryList.size() << " files has been unnpacked." << std::endl;
+std::vector<std::uint8_t> RcfArchive::readMember(std::size_t index) const {
+    if (index >= members_.size()) {
+        throw std::out_of_range("member index out of range");
+    }
+    const auto& m = members_[index];
+    return slice(m.offset, m.size);
 }
 
-void RcfFile::MakeHeader(std::vector<uint8_t>& data)
-{
-	//Name
-	std::string name = "ATG CORE CEMENT LIBRARY";
-	for (size_t i = 0; i < 32; i++) {
-		if (name.length() > i)
-			data.push_back(name[i]);
-		else
-			data.push_back(0);
-	}
-
-	data.push_back(2);	//Major version
-	data.push_back(1);	//Minor version
-	data.push_back(0);	//Endianess (Little)
-	data.push_back(1);	//idk but it crashs if it is not 1.
-
-	//Entry offset. Always is 3C.
-	std::vector<uint8_t> arr = ValueToArray(4, 0x3C);
-	data.insert(std::end(data), std::begin(arr), std::end(arr));
-
-	//Entry length. 0 for now
-	arr = ValueToArray(4, 0x0);
-	data.insert(std::end(data), std::begin(arr), std::end(arr));
-
-	//Metadata offset. 0 for now
-	data.insert(std::end(data), std::begin(arr), std::end(arr));
-
-	//Metadata length. 0 for now
-	data.insert(std::end(data), std::begin(arr), std::end(arr));
-
-	//Null padding. Always 0
-	data.insert(std::end(data), std::begin(arr), std::end(arr));
-
-	//Number of files. 0 for now
-	data.insert(std::end(data), std::begin(arr), std::end(arr));
+std::filesystem::path RcfArchive::extract(
+    std::size_t index, const std::filesystem::path& outDir) const {
+    if (index >= members_.size()) {
+        throw std::out_of_range("member index out of range");
+    }
+    const auto& m = members_[index];
+    // Engine paths use '\'; map to the platform separator on extraction.
+    std::string portable = m.name;
+    if (!portable.empty()) {
+        for (char& ch : portable) {
+            if (ch == '\\') {
+                ch = static_cast<char>(std::filesystem::path::preferred_separator);
+            }
+        }
+    }
+    std::filesystem::path rel;
+    if (!portable.empty()) {
+        rel = portable;
+    } else {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%08X.bin", m.hash);
+        rel = buf;
+    }
+    const std::filesystem::path dest = outDir / rel;
+    std::filesystem::create_directories(dest.parent_path());
+    WriteWholeFile(dest, slice(m.offset, m.size));
+    return dest;
 }
 
-void RcfFile::MakeEntry(std::vector<std::string> path)
-{
-	if (useSlash)
-		path[1] = "\\" + path[1];
-
-	//Metadata
-	RcfMetadata metadata = RcfMetadata();
-	metadata.date = (time_t)std::time(nullptr);
-	metadata.filenameLength = path[1].length();
-	metadata.filename = path[1];
-	metadataList.push_back(metadata);
-
-	//File
-	std::ifstream stream(path[0], std::ifstream::binary);
-	std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
-	stream.close();
-
-	//Entry
-	RcfEntry entry = RcfEntry();
-	entry.hash = HashString(path[1].c_str());
-	entry.dataLength = buffer.size();
-	entry.dataOffset = 0;
-	entry.data = buffer;
-	entry.metadata = &metadataList.back();
-	entryList.push_back(entry);
-
+std::size_t RcfArchive::extractAll(const std::filesystem::path& outDir) const {
+    for (std::size_t i = 0; i < members_.size(); ++i) {
+        extract(i, outDir);
+    }
+    return members_.size();
 }
 
-size_t RcfFile::PackEntry(size_t index, std::vector<uint8_t>& data)
-{
-	std::vector<uint8_t> arr = ValueToArray(4, entryList[index].hash);
-	for (size_t i = 0; i < arr.size(); i++)
-		data.push_back(arr[i]);
-
-	for (size_t i = 0; i < arr.size(); i++)
-		data.push_back(0);
-
-	arr = ValueToArray(4, entryList[index].dataLength);
-	for (size_t i = 0; i < arr.size(); i++)
-		data.push_back(arr[i]);
-
-	return 0;
+std::vector<std::string> RcfArchive::verify() const {
+    std::vector<std::string> problems;
+    if (header_.name != kMagicAtg && header_.name != kMagicRadcore) {
+        problems.push_back("unknown magic: '" + header_.name + "'");
+    }
+    if (!header_.libraryValid) {
+        problems.push_back("library-valid flag not set");
+    }
+    if (header_.numberOfFiles * kRcfEntrySize != header_.entryLength) {
+        problems.push_back("entryLength != numberOfFiles * 12");
+    }
+    for (std::size_t i = 1; i < members_.size(); ++i) {
+        if (members_[i].hash < members_[i - 1].hash) {
+            problems.push_back("directory not sorted by hash at index " +
+                                std::to_string(i));
+            break;
+        }
+    }
+    for (std::size_t i = 0; i < members_.size(); ++i) {
+        const auto& m = members_[i];
+        if (static_cast<std::uint64_t>(m.offset) + m.size > image_.size()) {
+            problems.push_back("member " + std::to_string(i) +
+                                " data out of range");
+        }
+        if (m.name.empty()) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf,
+                          "member %zu (hash %08X) has no name", i, m.hash);
+            problems.push_back(buf);
+        }
+    }
+    return problems;
 }
 
-size_t RcfFile::PackMetadata(size_t index, std::vector<uint8_t>& data)
-{
-	size_t size = 0;
+// --- Packing (EXPERIMENTAL) --------------------------------------------
+// Rebuilds a Prototype 2-style archive: 60-byte header, entry directory
+// immediately after, metadata table page-aligned at 0x800, member data
+// page-aligned at 0x1000. Directory is sorted by hash.
 
-	size += 4;
-	std::vector<uint8_t> arr = ValueToArray(4, metadataList[index].date);
-	for (size_t i = 0; i < arr.size(); i++)
-		data.push_back(arr[i]);
+namespace {
 
-	size += 4;
-	for (size_t i = 0; i <4; i++)
-		data.push_back(metadataList[index].padding[i]);
+constexpr std::uint32_t kPageAlign = 2048;
 
-	size += 4;
-	for (size_t i = 0; i < 4; i++)
-		data.push_back(metadataList[index].empty[i]);
-
-	size += 4;
-	arr = ValueToArray(4, metadataList[index].filenameLength + 1);
-	for (size_t i = 0; i < arr.size(); i++)
-		data.push_back(arr[i]);
-
-	size += metadataList[index].filename.length() + 1;
-	for (size_t i = 0; i < metadataList[index].filename.length(); i++)
-		data.push_back(metadataList[index].filename[i]);
-	data.push_back(0);
-
-	//Inbetween item pad
-	size += 3;
-	for (size_t i = 0; i < 3; i++)
-		data.push_back(0);
-
-	return size;
+void PadTo(std::vector<std::uint8_t>& out, std::uint32_t align) {
+    while (out.size() % align != 0) {
+        out.push_back(0);
+    }
 }
 
-bool CompareByHash(RcfEntry entry1, RcfEntry entry2)
-{
-	return (entry1.hash < entry2.hash);
+struct PackItem {
+    std::uint32_t hash = 0;
+    std::string name;
+    std::vector<std::uint8_t> data;
+};
+
+} // namespace
+
+void RcfArchive::pack(const std::filesystem::path& srcDir,
+                      const std::filesystem::path& outFile) {
+    if (!std::filesystem::is_directory(srcDir)) {
+        throw std::runtime_error("source is not a directory: " +
+                                 srcDir.string());
+    }
+    std::vector<PackItem> items;
+    for (const auto& e :
+         std::filesystem::recursive_directory_iterator(srcDir)) {
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        std::error_code ec;
+        std::string rel =
+            std::filesystem::relative(e.path(), srcDir, ec).string();
+        if (ec) {
+            throw std::runtime_error("cannot relativise path: " +
+                                     e.path().string());
+        }
+        rel = NormaliseRcfPath(rel);
+        PackItem it;
+        it.name = rel;
+        it.hash = RadicalHash(rel);
+        it.data = ReadWholeFile(e.path());
+        items.push_back(std::move(it));
+    }
+    std::sort(items.begin(), items.end(), [](const PackItem& a,
+                                             const PackItem& b) {
+        return a.hash < b.hash;
+    });
+    for (std::size_t i = 1; i < items.size(); ++i) {
+        if (items[i].hash == items[i - 1].hash) {
+            throw std::runtime_error("hash collision between '" +
+                                     items[i - 1].name + "' and '" +
+                                     items[i].name + "'");
+        }
+    }
+
+    std::vector<std::uint8_t> out;
+    out.reserve(1 << 20);
+
+    // Header (filled in as offsets become known).
+    {
+        const std::string magic = kMagicAtg;
+        out.insert(out.end(), magic.begin(), magic.end());
+        out.resize(32, 0);
+        AppendU32LE(out, kVersionPrototype2);
+        AppendU32LE(out, 0); // entryOffset (patched below)
+        AppendU32LE(out, 0); // entryLength (patched below)
+        AppendU32LE(out, 0); // metadataOffset (patched below)
+        AppendU32LE(out, 0); // metadataLength (patched below)
+        AppendU32LE(out, 0); // reserved
+        AppendU32LE(out, static_cast<std::uint32_t>(items.size()));
+    }
+    auto patchU32 = [&out](std::size_t at, std::uint32_t v) {
+        out[at] = static_cast<std::uint8_t>(v & 0xFF);
+        out[at + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+        out[at + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFF);
+        out[at + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFF);
+    };
+    // Endian flag (0) + library-valid (1).
+    out[EnumToValue(RcfHeaderOffsets::EndianFlag)] = 0;
+    out[EnumToValue(RcfHeaderOffsets::LibraryValid)] = 1;
+
+    // Entry directory (hash, offset-placeholder, size).
+    const std::uint32_t entryOffset = static_cast<std::uint32_t>(out.size());
+    std::vector<std::size_t> offsetPatchAt;
+    for (const auto& it : items) {
+        AppendU32LE(out, it.hash);
+        offsetPatchAt.push_back(out.size());
+        AppendU32LE(out, 0);
+        AppendU32LE(out, static_cast<std::uint32_t>(it.data.size()));
+    }
+    patchU32(EnumToValue(RcfHeaderOffsets::EntryOffset), entryOffset);
+    patchU32(EnumToValue(RcfHeaderOffsets::EntryLength),
+             static_cast<std::uint32_t>(items.size() * kRcfEntrySize));
+
+    // Metadata table.
+    PadTo(out, kPageAlign);
+    const std::uint32_t metaOffset = static_cast<std::uint32_t>(out.size());
+    {
+        AppendU32LE(out, 0x800);
+        AppendU32LE(out, 0);
+    }
+    for (const auto& it : items) {
+        AppendU32LE(out, static_cast<std::uint32_t>(std::time(nullptr)));
+        out.insert(out.end(), {0x00, 0x08, 0x00, 0x00});
+        AppendU32LE(out, 0);
+        const std::uint32_t len = static_cast<std::uint32_t>(it.name.size() + 1);
+        AppendU32LE(out, len);
+        out.insert(out.end(), it.name.begin(), it.name.end());
+        out.push_back(0);
+        out.insert(out.end(), 3, 0);
+    }
+    patchU32(EnumToValue(RcfHeaderOffsets::MetadataOffset), metaOffset);
+    patchU32(EnumToValue(RcfHeaderOffsets::MetadataLength),
+             static_cast<std::uint32_t>(out.size() - metaOffset));
+
+    // Member data.
+    PadTo(out, 0x1000);
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        patchU32(offsetPatchAt[i], static_cast<std::uint32_t>(out.size()));
+        out.insert(out.end(), items[i].data.begin(), items[i].data.end());
+        if (i + 1 < items.size()) {
+            PadTo(out, kPageAlign);
+        }
+    }
+
+    WriteWholeFile(outFile, out);
+    std::cout << "packed " << items.size() << " files -> " << outFile.string()
+              << " (" << out.size() << " bytes)\n";
 }
-
-void RcfFile::Serialize(std::string filename, bool slashit)
-{
-	useSlash = slashit;
-	std::cout << "Packing..." << std::endl;
-
-	std::vector<uint8_t> binaryFile{};
-	MakeHeader(binaryFile);
-
-	std::string path = std::filesystem::current_path().string() + "\\" + TOPACK_FOLDER_MAME;
-	
-	size_t numOfFiles = 0;
-	for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
-		if (std::filesystem::is_regular_file(entry)) {
-			std::vector<std::string> paths{};
-			paths.push_back(entry.path().string());
-
-			std::string shortStr = entry.path().string();
-			shortStr.erase(0, path.length() + 1);
-			paths.push_back(shortStr);
-
-			++numOfFiles;
-			MakeEntry(paths);
-		}
-	}
-
-	std::sort(entryList.begin(), entryList.end(), CompareByHash);
-
-	//Set the number of files
-	std::vector<uint8_t> arr = ValueToArray(4, numOfFiles);
-	for (size_t i = 0; i < 4; i++)
-		binaryFile[EnumToValue(RcfHeaderOffsets::NumberOfFiles) + i] = arr[i];
-
-	//Pack entries
-	for (size_t i = 0; i < entryList.size(); i++) {
-		PackEntry(i, binaryFile);
-	}
-
-	//Adds padding
-	while(binaryFile.size() % 2048)
-		binaryFile.push_back(0);
-
-	arr = ValueToArray(4, binaryFile.size());
-	for (size_t i = 0; i < arr.size(); i++)
-		binaryFile[EnumToValue(RcfHeaderOffsets::MetadataOffset) + i] = arr[i];
-
-	arr = { 0, 8, 0, 0 };
-	for (size_t i = 0; i < 4; i++)
-		binaryFile.push_back(arr[i]);
-
-	arr = { 0, 0, 0, 0 };
-	for (size_t i = 0; i < 4; i++)
-		binaryFile.push_back(arr[i]);
-
-	//Pack metadata
-
-	size_t size = 8;
-	for (size_t i = 0; i < metadataList.size(); i++) {
-		size += PackMetadata(i, binaryFile);
-	}
-
-	arr = ValueToArray(4, size);
-	for (size_t i = 0; i < arr.size(); i++)
-		binaryFile[EnumToValue(RcfHeaderOffsets::MetadataLength) + i] = arr[i];
-
-	//Adds padding
-	while (binaryFile.size() % 2048)
-		binaryFile.push_back(0);
-
-	//Pack files
-	arr = ValueToArray(4, entryList.size() * 12);
-	for (size_t i = 0; i < 4; i++)
-		binaryFile[EnumToValue(RcfHeaderOffsets::EntryLength) + i] = arr[i];
-
-	for (size_t i = 0; i < entryList.size(); i++) {
-		size_t a = 0x3C + 4 + (12 * i);
-
-		//Sew the reference
-		arr = ValueToArray(4, binaryFile.size());
-		for (size_t j = 0; j < arr.size(); j++) {
-			binaryFile[a + j] = arr[j];
-		}
-
-		//Write the file data
-		for (size_t j = 0; j < entryList[i].data.size(); j++) {
-			binaryFile.push_back(entryList[i].data[j]);
-		}
-
-		//Add the padding
-		if(i < entryList.size() - 1)
-			while (binaryFile.size() % 2048)
-				binaryFile.push_back(0);
-	}
-
-	std::ofstream os(filename, std::ios::out | std::ios::binary);
-	os.write(reinterpret_cast<const char*>(&binaryFile[0]), binaryFile.size() * sizeof(uint8_t));
-
-
-	std::cout << "Packing done! " << numOfFiles << " files has been packed." << std::endl;
-}
-
-
